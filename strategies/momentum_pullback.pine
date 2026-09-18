@@ -1,0 +1,127 @@
+//@version=6
+// Regime-Filtered Momentum Pullback — US equities, daily timeframe.
+//
+// Three stacked edges: a market regime filter (no longs while SPY is below its
+// 200 SMA), relative-strength momentum, and a pullback entry that keeps the
+// initial stop tight so winners run at a high R multiple.
+//
+// Single-symbol backtest. Portfolio rules that Pine cannot express on one
+// chart — max 8 concurrent positions, max 2 per sector, and the earnings
+// blackout — are documented in strategies/README.md and must be applied by
+// the screener that feeds this strategy.
+
+strategy("Regime-Filtered Momentum Pullback",
+  overlay                 = true,
+  initial_capital         = 100000,
+  currency                = currency.USD,
+  default_qty_type        = strategy.fixed,
+  pyramiding              = 0,
+  commission_type         = strategy.commission.percent,
+  commission_value        = 0.01,
+  slippage                = 2,
+  calc_on_every_tick      = false,
+  process_orders_on_close = false)
+
+// ---------------------------------------------------------------- inputs ---
+grpR   = "Regime"
+useReg = input.bool(true,  "Require market regime ON",     group = grpR)
+regSym = input.symbol("AMEX:SPY", "Regime benchmark",      group = grpR)
+regLen = input.int(200,    "Benchmark SMA length",         group = grpR, minval = 20)
+
+grpT   = "Trend & momentum"
+fastLen = input.int(50,  "Fast EMA",                       group = grpT, minval = 5)
+slowLen = input.int(200, "Slow EMA",                       group = grpT, minval = 20)
+rsLook  = input.int(126, "Relative-strength lookback (bars)", group = grpT, minval = 20)
+
+grpE   = "Pullback entry"
+pullLen = input.int(20, "Pullback EMA",                    group = grpE, minval = 5)
+rsiLen  = input.int(3,  "RSI length",                      group = grpE, minval = 2)
+rsiTrig = input.float(25, "RSI trigger (below)",           group = grpE, minval = 1)
+
+grpX   = "Exits"
+atrLen   = input.int(14,   "ATR length",                   group = grpX, minval = 2)
+stopMult = input.float(2.0, "Initial stop (x ATR)",        group = grpX, minval = 0.5, step = 0.25)
+trailMult= input.float(3.0, "Chandelier trail (x ATR)",    group = grpX, minval = 0.5, step = 0.25)
+timeStop = input.int(20,   "Time stop (bars)",             group = grpX, minval = 1)
+
+grpS   = "Risk"
+riskPct = input.float(1.0, "Risk per trade (% of equity)", group = grpS, minval = 0.1, step = 0.1)
+maxPos  = input.float(20.0, "Max position size (% of equity)", group = grpS, minval = 1.0, step = 1.0)
+
+// ------------------------------------------------------------- indicators ---
+emaFast = ta.ema(close, fastLen)
+emaSlow = ta.ema(close, slowLen)
+emaPull = ta.ema(close, pullLen)
+rsi     = ta.rsi(close, rsiLen)
+atr     = ta.atr(atrLen)
+
+// Benchmark pulled at daily resolution with lookahead off so the regime and
+// relative-strength reads use only data that was closed at the time.
+[benchClose, benchSma] = request.security(regSym, "D",
+  [close, ta.sma(close, regLen)], lookahead = barmerge.lookahead_off)
+
+regimeOn = not useReg or (benchClose > benchSma)
+
+// Relative strength: the stock has to have outrun the benchmark over the
+// lookback, not merely be rising.
+stockRet = close / close[rsLook] - 1.0
+benchRet = benchClose / benchClose[rsLook] - 1.0
+rsOK     = not na(stockRet) and not na(benchRet) and stockRet > benchRet
+
+trendOK    = close > emaFast and emaFast > emaSlow
+pullbackOK = rsi < rsiTrig or low <= emaPull
+setup      = regimeOn and trendOK and rsOK and pullbackOK
+
+// ------------------------------------------------------------------ entry ---
+// Buy-stop one tick above the setup bar's high: price has to turn back up
+// before we pay for it. The order is re-placed each bar, so an unfilled one
+// expires after a single bar rather than lingering.
+var float initStop  = na
+var float runupHigh = na
+var int   entryBar  = na
+
+flat = strategy.position_size == 0
+
+if flat
+    strategy.cancel("Long")
+    if setup
+        trigger = high + syminfo.mintick
+        stopPx  = trigger - stopMult * atr
+        risk    = trigger - stopPx
+        riskQty = risk > 0 ? math.floor(strategy.equity * riskPct / 100.0 / risk) : 0
+        // A low-ATR name sizes up enormously on risk alone — cap the notional so
+        // one quiet stock cannot become a third of the book.
+        capQty  = math.floor(strategy.equity * maxPos / 100.0 / trigger)
+        qty     = math.min(riskQty, capQty)
+        if qty > 0
+            strategy.entry("Long", strategy.long, qty = qty, stop = trigger)
+
+// ------------------------------------------------------------------ exits ---
+justEntered = strategy.position_size > 0 and strategy.position_size[1] == 0
+
+if justEntered
+    initStop  := strategy.position_avg_price - stopMult * atr
+    runupHigh := high
+    entryBar  := bar_index
+
+if strategy.position_size > 0
+    runupHigh := math.max(nz(runupHigh, high), high)
+    // Chandelier trail, ratcheted against the initial stop so it never loosens.
+    stopLevel = math.max(nz(initStop, runupHigh - trailMult * atr), runupHigh - trailMult * atr)
+    strategy.exit("Exit", "Long", stop = stopLevel)
+
+    // Dead money: no progress after timeStop bars frees the risk budget.
+    if bar_index - nz(entryBar, bar_index) >= timeStop and close < strategy.position_avg_price
+        strategy.close("Long", comment = "Time stop")
+
+if flat
+    initStop  := na
+    runupHigh := na
+
+// ------------------------------------------------------------------- plots ---
+plot(emaFast, "EMA fast", color.new(color.blue, 0),   linewidth = 1)
+plot(emaSlow, "EMA slow", color.new(color.orange, 0), linewidth = 2)
+plot(emaPull, "EMA pullback", color.new(color.gray, 40))
+bgcolor(regimeOn ? na : color.new(color.red, 92), title = "Regime OFF")
+plotshape(flat and setup, "Setup", shape.triangleup, location.belowbar,
+  color.new(color.teal, 0), size = size.tiny)
