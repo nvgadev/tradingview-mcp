@@ -1,0 +1,149 @@
+{
+ "_note": "All times US Eastern. Entries are paused from `before` minutes before to `after` minutes after; an open trade is closed `flatten_before_min` minutes before. Add events by hand: weekly jobless claims, Fed speeches, retail sales after Oct 15 are NOT included.",
+ "events": [
+  {
+   "name": "US producer prices (PPI)",
+   "at": "2026-10-15 08:30",
+   "before": 30,
+   "after": 30
+  },
+  {
+   "name": "US retail sales",
+   "at": "2026-10-15 08:30",
+   "before": 30,
+   "after": 30
+  },
+  {
+   "name": "Fed interest-rate decision",
+   "at": "2026-10-28 14:00",
+   "before": 30,
+   "after": 90
+  },
+  {
+   "name": "US GDP and PCE inflation",
+   "at": "2026-10-29 08:30",
+   "before": 30,
+   "after": 30
+  },
+  {
+   "name": "US jobs report",
+   "at": "2026-11-06 08:30",
+   "before": 30,
+   "after": 30
+  },
+  {
+   "name": "US CPI inflation",
+   "at": "2026-11-10 08:30",
+   "before": 30,
+   "after": 30
+  },
+  {
+   "name": "US producer prices (PPI)",
+   "at": "2026-11-13 08:30",
+   "before": 30,
+   "after": 30
+  },
+  {
+   "name": "US GDP and PCE inflation",
+   "at": "2026-11-25 08:30",
+   "before": 30,
+   "after": 30
+  },
+  {
+   "name": "US jobs report",
+   "at": "2026-12-04 08:30",
+   "before": 30,
+   "after": 30
+  },
+  {
+   "name": "Fed interest-rate decision",
+   "at": "2026-12-09 14:00",
+   "before": 30,
+   "after": 90
+  },
+  {
+   "name": "US CPI inflation",
+   "at": "2026-12-10 08:30",
+   "before": 30,
+   "after": 30
+  },
+  {
+   "name": "US producer prices (PPI)",
+   "at": "2026-12-15 08:30",
+   "before": 30,
+   "after": 30
+  },
+  {
+   "name": "US GDP and PCE inflation",
+   "at": "2026-12-23 08:30",
+   "before": 30,
+   "after": 30
+  },
+  {
+   "name": "US jobs report",
+   "at": "2027-01-08 08:30",
+   "before": 30,
+   "after": 30
+  },
+  {
+   "name": "US CPI inflation",
+   "at": "2027-01-13 08:30",
+   "before": 30,
+   "after": 30
+  },
+  {
+   "name": "US producer prices (PPI)",
+   "at": "2027-01-14 08:30",
+   "before": 30,
+   "after": 30
+  },
+  {
+   "name": "Fed interest-rate decision",
+   "at": "2027-01-27 14:00",
+   "before": 30,
+   "after": 90
+  },
+  {
+   "name": "US jobs report",
+   "at": "2027-02-05 08:30",
+   "before": 30,
+   "after": 30
+  },
+  {
+   "name": "US CPI inflation",
+   "at": "2027-02-11 08:30",
+   "before": 30,
+   "after": 30
+  },
+  {
+   "name": "US producer prices (PPI)",
+   "at": "2027-02-12 08:30",
+   "before": 30,
+   "after": 30
+  },
+  {
+   "name": "US jobs report",
+   "at": "2027-03-05 08:30",
+   "before": 30,
+   "after": 30
+  },
+  {
+   "name": "US CPI inflation",
+   "at": "2027-03-10 08:30",
+   "before": 30,
+   "after": 30
+  },
+  {
+   "name": "US producer prices (PPI)",
+   "at": "2027-03-12 08:30",
+   "before": 30,
+   "after": 30
+  },
+  {
+   "name": "Fed interest-rate decision",
+   "at": "2027-03-17 14:00",
+   "before": 30,
+   "after": 90
+  }
+ ]
+}

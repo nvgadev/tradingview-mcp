@@ -1,0 +1,1030 @@
+//@version=6
+// ==========================================================================
+//  GOPI HEDGE X PRO   -   Pine Script v6 indicator (study, not strategy)
+//  Rebuilt from the "Gopi Hedge X Pro" indicator screenshots.
+//  Spec-confirmed defaults (see project spec discussion).
+//
+//  ENGINEERING GUARANTEES
+//   * NO REPAINT   - trend flip / R-arm / ENTRY (the signals that define a
+//                    trade's identity) are gated on barstate.isconfirmed,
+//                    so they only print after the bar closes and never move
+//   * NO LOOKAHEAD - the single request.security() call uses
+//                    barmerge.lookahead_off
+//   * CLOSED-BAR   - ENTRY / flip markers are placed on confirmed bars only.
+//                    TP1 / TP2 / TP3 / SL hit markers are the one exception:
+//                    they watch an already-fixed level (set at a confirmed
+//                    ENTRY) in real time, every tick, so the hit fires the
+//                    instant price touches it instead of waiting for the
+//                    bar to close - this cannot repaint a trade's identity,
+//                    it only detects a touch on a price that is already set
+//   * UNIVERSAL    - all thresholds ATR- or %-normalised; index (no-volume)
+//                    fallback to price-action flow; syminfo.mintick /
+//                    syminfo.pointvalue aware (micro vs full contracts)
+//   * MODULAR      - f_* function per feature; main body = calls + drawing
+// ==========================================================================
+indicator("GOPI HEDGE X PRO", shorttitle = "HEDGEX PRO", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 20)
+
+// ============================== INPUTS =====================================
+gT = "Trend"
+trendLen   = input.int(22,    "Trend lookback (N)",     minval = 1,               group = gT, tooltip = "Bars for the highest/lowest extreme of the Chandelier-Exit trailing stop.")
+atrLen     = input.int(22,    "ATR length",             minval = 1,               group = gT, tooltip = "ATR period for the trailing-stop offset and for every ATR-normalised threshold in the script.")
+atrMult    = input.float(3.0, "ATR multiplier",         minval = 0.1, step = 0.1, group = gT, tooltip = "Trailing-stop distance = ATR x this. Larger = looser trend, fewer flips.")
+useCloseEx = input.bool(true, "Use close for extremes", group = gT, tooltip = "Chandelier Exit: base highest/lowest on close (on) or on high/low (off).")
+useStdOHLC = input.bool(true, "Use standard OHLC",      group = gT, tooltip = "Compute on regular candles even when the chart is Heikin Ashi / Renko / line-break. Uses lookahead_off -> non-repainting.")
+
+gV = "Volume Delta"
+deltaModeIn = input.string("Cumulative since flip", "Delta window mode", options = ["Cumulative since flip", "Fixed rolling window"], group = gV, tooltip = "Cumulative: buy/sell volume builds from the current trend flip and resets on the next flip. Fixed: rolling sum of the last N bars.")
+deltaWin    = input.int(20,    "Fixed window length",         minval = 1,               group = gV, tooltip = "Bars for the fixed rolling-window mode.")
+deltaThr    = input.float(0.0, "Pressure threshold (delta %)", minval = 0.0, step = 0.5, group = gV, tooltip = "abs(Delta %) must exceed this for BUY/SELL PRESSURE, otherwise NEUTRAL.")
+
+gS = "TP / SL"
+slAtrMult = input.float(1.5, "SL distance (ATR mult)", minval = 0.1, step = 0.1, group = gS, tooltip = "Stop distance from entry = ATR x this. This distance is defined as 1R.")
+tp1Mult   = input.float(1.0, "TP1 (R multiple)",       minval = 0.1, step = 0.1, group = gS)
+tp2Mult   = input.float(2.0, "TP2 (R multiple)",       minval = 0.1, step = 0.1, group = gS)
+tp3Mult   = input.float(3.0, "TP3 (R multiple)",       minval = 0.1, step = 0.1, group = gS)
+hlHits    = input.bool(true, "Recolour a level when price touches it", group = gS)
+beLockR   = input.float(0.2, "BE lock profit (R multiple)", minval = 0.0, step = 0.05, group = gS, tooltip = "After TP1 hits, the stop moves to entry price PLUS this many R (in the trade's favour), not exactly breakeven - locks in a small guaranteed profit instead of a net-zero exit if price reverses. 0 = old exact-breakeven behaviour.")
+
+gR = "Re-entry (R1/R2/R3...)"
+r1PbAtr    = input.float(0.5, "Pullback minimum (ATR mult)",  minval = 0.0, step = 0.1, group = gR, tooltip = "Minimum retrace (in ATR) from the extreme reached since the flip / since the previous trade in this direction closed, before the next re-entry can arm.")
+r1Lookback = input.int(20,    "Max bars to arm each re-entry", minval = 1,               group = gR, tooltip = "Each re-entry (R1, R2, R3, ...) must arm within this many bars of the trend flip (for R1) or of the previous same-direction trade closing (for R2, R3, ...). Widened from 10 to 20 alongside a stricter confidence filter, so a setup has more bars to find one that also clears the confidence bar instead of the window closing before a qualifying entry ever appears - this is what recovers trade count at a stricter filter without lowering the filter itself.")
+r1Force    = input.bool(true, "Enter at lookback end if none", group = gR, tooltip = "If no qualifying pullback happens, take the next re-entry at the end of the lookback window anyway.")
+
+gTS = "Trading Session"
+useSession = input.bool(true, "Restrict new entries to a session", group = gTS, tooltip = "When on, R1/R2/R3 entries only fire inside the session window below. Trend flips, the dashboard, and TP/SL/breakeven monitoring on an already-open trade keep running 24/7 regardless - only the act of opening a NEW trade is restricted.")
+sessionStr = input.session("0700-1630", "Session (new entries only)", group = gTS, tooltip = "Exchange-timezone session string, e.g. 0700-1630 = 7:00 AM to 4:30 PM in the symbol's exchange timezone (New York time for COMEX gold on TradingView). CME gold pauses at 5:00 PM New York time, so the session must end before that; open trades are closed when it ends.")
+useSession2 = input.bool(true, "Also allow a second window (evening)", group = gTS, tooltip = "ON: new entries are also allowed in the second window below. Trades are closed at the end of EACH window (nothing is carried between windows).")
+sessionStr2 = input.session("1800-2130", "Second session (new entries only)", group = gTS, tooltip = "Same rules as the first session. 1800-2130 = 6:00 PM to 9:30 PM New York time (COMEX gold reopens at 6:00 PM).")
+
+gCF = "Confluence Filters"
+useVwapFilter = input.bool(false, "VWAP: entries must be on VWAP's favourable side", group = gCF, tooltip = "Long entries only fire when price is above session VWAP, short only when below. Independent A/B test toggle - off by default, kept off alongside the other three confluence filters so only one is ever isolated at a time.")
+useEmaFilter  = input.bool(false, "EMA cross: entries must have fast/slow EMA aligned", group = gCF, tooltip = "Long entries only fire when the fast EMA is above the slow EMA, short only when below.")
+emaFastLen    = input.int(9,  "EMA fast length", minval = 1, group = gCF)
+emaSlowLen    = input.int(21, "EMA slow length", minval = 1, group = gCF)
+useOrbFilter  = input.bool(false, "ORB: entries must be past the opening-range breakout", group = gCF, tooltip = "Long entries only fire once price has broken above the opening-range high, short only once below the opening-range low.")
+orbRangeStr   = input.session("0800-0815", "Opening range window", group = gCF, tooltip = "First few minutes of the session that define the opening-range high/low, in the symbol's exchange timezone.")
+useFibFilter  = input.bool(false, "Fib: pullback must land in a retracement zone", group = gCF, tooltip = "Replaces the fixed ATR pullback minimum above with a Fibonacci-ratio band of the move since the last flip - the pullback must retrace between the two ratios below before a re-entry can arm.")
+fibMin        = input.float(0.382, "Fib zone min", minval = 0.0, maxval = 1.0, step = 0.01, group = gCF)
+fibMax        = input.float(0.618, "Fib zone max", minval = 0.0, maxval = 1.0, step = 0.01, group = gCF)
+useRibbonFilter = input.bool(false, "LogReg ribbon: entries must align with the ribbon", group = gCF, tooltip = "Long entries only fire when the log-regression ribbon (BigBeluga LogReg Channel-Trend) is green/up, short only when red/down. This is a much slower, longer-lookback trend read than the main Chandelier trend - the idea is to filter out entries taken during a sideways/consolidating phase and keep only ones aligned with a genuine larger move.")
+ribbonLen       = input.int(100, "Ribbon lookback (log-regression length)", minval = 10, group = gCF)
+useAtrExpFilter = input.bool(true, "ATR expansion: entries must occur during rising volatility", group = gCF, tooltip = "Entries only fire when the current ATR is above its own N-bar average - i.e. volatility is expanding, not quiet/consolidating. Direction-agnostic (applies to both long and short) - meant to skip entries taken during a flat/sideways chop and only take ones where a real, bigger move is already underway.")
+atrExpLen       = input.int(50, "ATR expansion average length", minval = 5, group = gCF)
+useEmaXRFilter  = input.bool(false, "EMA cross-type filter: entries gated by the EMA mechanism below", group = gCF, tooltip = "Long/short entries additionally require the EMA condition selected below. Independent of the plain EMA-alignment filter above - this toggle drives a single switchable EMA mechanism so different EMA cross ideas can be A/B tested one at a time without piling up separate toggles.")
+emaCrossType    = input.string("Triple EMA stack", "EMA cross type", options = ["Gap expanding", "Retest only", "Fresh crossover", "EMA slope", "Triple EMA stack"], group = gCF, tooltip = "Gap expanding: |fast-slow| EMA gap wider than previous bar (trend accelerating). Retest only: current bar's wick touched the fast EMA and closed back on the trend side. Fresh crossover: fast/slow EMA crossed within the lookback below AND is still aligned with the trade direction (catches the crossover ITSELF, not just standing alignment). EMA slope: fast EMA has net-moved in the trade direction over the lookback below (rising for longs, falling for shorts). Triple EMA stack: fast > slow > a third, slower EMA (fully stacked trend), or reversed for shorts.")
+emaCrossLookback = input.int(5, "Fresh-cross / slope lookback (bars)", minval = 1, group = gCF)
+emaTripleLen     = input.int(50, "Triple EMA - 3rd (slowest) length", minval = 1, group = gCF)
+
+gPV = "Fib Pivot (Daily, Fibonacci)"
+usePivotFilter      = input.bool(false, "Pivot filter: price must be on favourable side of the daily Pivot Point (PP)", group = gPV, tooltip = "Long entries only fire when price is above the previous day's Fibonacci Pivot Point, short only when below. Mirrors the 'Pivot Points Standard' (Type=Fibonacci, Timeframe=Auto/Daily) built-in indicator on the chart.")
+usePivotLevelExits  = input.bool(false, "Pivot level-to-level: TP1/TP2/TP3 = next 3 pivot levels", group = gPV, tooltip = "Replaces the fixed R-multiple TP1/TP2/TP3 above with the next 3 Fibonacci pivot levels beyond entry in the trade direction (R1/R2/R3 for longs, S1/S2/S3 for shorts). Falls back to the normal R-multiple target for any slot where fewer than 3 pivot levels remain above/below entry. SL stays ATR-based, unaffected.")
+usePivotBreakRetest = input.bool(false, "Pivot break & retest: entries require a retest of the nearest broken pivot level", group = gPV, tooltip = "Long entries only fire when the nearest pivot level below price has just been retested - the bar's low touched that level and closed back above it (a break-and-hold). Short entries mirror this against the nearest level above price.")
+
+gC = "Confidence Score"
+wTrend    = input.float(0.333, "Weight - entry freshness",     minval = 0.0, step = 0.001, group = gC, tooltip = "Weight of the freshness factor: an entry close to the trailing stop (fresh move) scores higher than one already far extended from it. The three weights are re-normalised to sum to 1.")
+wDelta    = input.float(0.333, "Weight - volume calmness",     minval = 0.0, step = 0.001, group = gC, tooltip = "Weight of the volume-calmness factor: a balanced, less one-sided volume print at entry scores higher than a huge one-sided imbalance (a likely climactic/exhaustion spike).")
+wPress    = input.float(0.334, "Weight - pressure alignment",  minval = 0.0, step = 0.001, group = gC)
+tsFullAtr = input.float(3.0,   "Freshness zero at N ATR",      minval = 0.1, step = 0.1,   group = gC, tooltip = "Price this many ATR away from the trailing stop scores 0% on the freshness factor (an already-extended move) - right at the stop scores 100%.")
+dsFullPct = input.float(50.0,  "Calmness zero at delta %",     minval = 1.0, step = 1.0,   group = gC, tooltip = "abs(Delta %) at or above this scores 0% on the volume-calmness factor (a one-sided imbalance) - a perfectly balanced 0% delta scores 100%.")
+minConfidence = input.int(55, "Minimum confidence to enter (0 = off)", minval = 0, maxval = 100, group = gC, tooltip = "A new entry (R1, R2, R3...) only fires when the confidence score on that bar is at least this - live data showed winners (TP3) averaging ~52% and losers (SL) averaging ~44%, so this is a real filter now, not just a display number. Set to 0 to take every signal regardless of score.")
+useHtfFilter = input.bool(true, "Only trade with the higher-timeframe trend", group = gC, tooltip = "ON: a BUY entry needs the higher-timeframe trend (same Chandelier rules, previous completed bar) to be UP, a SELL needs it DOWN. Idea: a 4-hour trend system showed an edge on gold; this makes the fast chart borrow its direction.")
+htfTfIn      = input.string("240", "Higher timeframe", options = ["60", "240", "D"], group = gC)
+
+gD = "Dashboard"
+showTable = input.bool(true,      "Show dashboard table", group = gD)
+tblPosIn  = input.string("Top right", "Table position",   options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = gD)
+tblSizeIn = input.string("Normal",   "Table text size",   options = ["Tiny", "Small", "Normal", "Large"], group = gD)
+showStatsTable = input.bool(true, "Show results table (bottom right)", group = gD, tooltip = "How the trades on this chart did: how many lost, small wins, big wins, total result for 1 contract after costs, biggest drop and worst losing streak.")
+
+gA = "Automation (paper / webhook)"
+autoAlertOn      = input.bool(true, "Send ONE JSON alert per bar with all trade events", group = gA, tooltip = "Create a single TradingView alert on this indicator with condition 'Any alert() function call'. Every bar that has an ENTRY / TP1 / TP2 / EXIT event sends one JSON message (entry, stop, targets, exit kind and price) to the webhook receiver. Replaces the nine separate alertcondition() alerts for automation.")
+webhookSecret    = input.string("CHANGE_ME", "Webhook secret (must match the receiver)", group = gA, tooltip = "Sent inside the JSON so the receiver can reject anything that is not from this indicator.")
+exitOnFlip      = input.bool(false, "Close the trade at market when the trend flips", group = gA, tooltip = "ON = the original behaviour: a Chandelier trend flip cancels the open trade and it is closed at the flip bar close. OFF = ignore the flip and keep the trade until its own stop / target (new entries stay blocked while it is open).")
+exitAtSessionEnd = input.bool(true, "Close an open trade when the entry session ends", group = gA, tooltip = "Uses the Trading Session window above. When ON, an open trade is closed at the open of the first bar after the session ends instead of being held overnight / through the weekend until a stop, target or trend flip.")
+costPerTrade     = input.float(5.0, "Round-trip cost per trade, $ (fees + slippage)", minval = 0.0, step = 1.0, group = gA, tooltip = "Only used for the NET $ rows of the stats table. Micro Gold: 1 tick slippage each way ($1+$1) plus about $2 fees = $5. Full Gold (GC): about $25.")
+
+gX = "Visuals"
+colLong      = input.color(#26a69a, "Long colour",  group = gX)
+colShort     = input.color(#ef5350, "Short colour", group = gX)
+colTP        = input.color(#22c55e, "TP colour",    group = gX)
+showStop     = input.bool(true, "Show trailing-stop line",       group = gX)
+showFlip     = input.bool(true, "Show BUY / SELL flip markers",  group = gX)
+showLevels   = input.bool(true, "Show ENTRY / SL / TP lines",    group = gX)
+scoreOnEntry = input.bool(true, "Show confidence % on ENTRY label", group = gX)
+showTpSlMarkers = input.bool(true, "Show TP / SL hit markers", group = gX, tooltip = "Plot a persistent marker on the exact bar each TP / SL level is hit. These are shape plots tied to bar_index, so every past trade keeps its markers as permanent history - never redrawn or moved.")
+
+// ============================ STANDARD OHLC ================================
+[stdO, stdH, stdL, stdC] = request.security(ticker.standard(syminfo.tickerid), timeframe.period, [open, high, low, close], lookahead = barmerge.lookahead_off)
+o = useStdOHLC ? nz(stdO, open)  : open
+h = useStdOHLC ? nz(stdH, high)  : high
+l = useStdOHLC ? nz(stdL, low)   : low
+c = useStdOHLC ? nz(stdC, close) : close
+
+symIsIndex = syminfo.type == "index"
+
+// manual ATR from the chosen OHLC so a HA / Renko chart cannot distort it
+tr     = na(c[1]) ? h - l : math.max(h - l, math.abs(h - c[1]), math.abs(l - c[1]))
+atrVal = ta.rma(tr, atrLen)
+
+// ============================ f_trend() ===================================
+// Chandelier-Exit style ATR trailing stop + discrete BUY / SELL direction.
+f_trend(float _h, float _l, float _c, simple int _len, float _atr, simple float _mult, simple bool _useClose) =>
+    float _hiSrc = _useClose ? _c : _h
+    float _loSrc = _useClose ? _c : _l
+    float _long  = ta.highest(_hiSrc, _len) - _mult * _atr
+    float _longPrev = nz(_long[1], _long)
+    _long := _c[1] > _longPrev ? math.max(_long, _longPrev) : _long
+    float _short = ta.lowest(_loSrc, _len) + _mult * _atr
+    float _shortPrev = nz(_short[1], _short)
+    _short := _c[1] < _shortPrev ? math.min(_short, _shortPrev) : _short
+    var int _dir = 1
+    _dir := _dir == -1 and _c > _shortPrev ? 1 : _dir == 1 and _c < _longPrev ? -1 : _dir
+    [_dir, _long, _short]
+
+[dir, longStop, shortStop] = f_trend(h, l, c, trendLen, atrVal, atrMult, useCloseEx)
+trendStop     = dir == 1 ? longStop : shortStop
+// direction of the SAME Chandelier trend on a higher timeframe, previous completed bar (no repaint)
+f_htfDir() =>
+    float _hh = high
+    float _ll = low
+    float _cc = close
+    float _tr = na(_cc[1]) ? _hh - _ll : math.max(_hh - _ll, math.abs(_hh - _cc[1]), math.abs(_ll - _cc[1]))
+    float _atr = ta.rma(_tr, atrLen)
+    [_d, _lg, _sh] = f_trend(_hh, _ll, _cc, trendLen, _atr, atrMult, useCloseEx)
+    _d
+htfDir = request.security(syminfo.tickerid, htfTfIn, f_htfDir()[1], lookahead = barmerge.lookahead_on)
+flipLong      = dir == 1  and dir[1] == -1
+flipShort     = dir == -1 and dir[1] == 1
+confFlipLong  = flipLong  and barstate.isconfirmed
+confFlipShort = flipShort and barstate.isconfirmed
+
+// gates NEW entries only (see step 3 below) - trend flips / dashboard / TP-SL
+// monitoring on an already-open trade are unaffected by this.
+inSession1 = not na(time(timeframe.period, sessionStr))
+inSession2 = useSession2 and not na(time(timeframe.period, sessionStr2))
+inSession  = not useSession or inSession1 or inSession2
+
+// confluence filter inputs - each only computed/used when its own toggle is on
+vwapVal   = ta.vwap(hlc3)
+emaFast   = ta.ema(c, emaFastLen)
+emaSlow   = ta.ema(c, emaSlowLen)
+emaGap    = math.abs(emaFast - emaSlow)
+emaGapExpanding = emaGap > emaGap[1]
+emaTriple = ta.ema(c, emaTripleLen)
+emaCrossEvent = ta.cross(emaFast, emaSlow)   // must be called unconditionally every bar, not inside an if
+var int barsSinceEmaCross = 999999
+barsSinceEmaCross := emaCrossEvent ? 0 : barsSinceEmaCross + 1
+newOrbDay = ta.change(time("D")) != 0   // must be called unconditionally every bar, not inside an if
+
+// ==================== Fib Pivot levels (Daily, Fibonacci) =================
+// Replicates the "Pivot Points Standard" built-in (Type=Fibonacci, TF=Auto)
+// that's on the chart: PP/R1-3/S1-3 from the PREVIOUS completed day's H/L/C.
+[pdH, pdL, pdC] = request.security(syminfo.tickerid, "D", [high[1], low[1], close[1]], lookahead = barmerge.lookahead_off)
+pivRange = pdH - pdL
+pivPP = (pdH + pdL + pdC) / 3
+pivR1 = pivPP + 0.382 * pivRange
+pivR2 = pivPP + 0.618 * pivRange
+pivR3 = pivPP + 1.000 * pivRange
+pivS1 = pivPP - 0.382 * pivRange
+pivS2 = pivPP - 0.618 * pivRange
+pivS3 = pivPP - 1.000 * pivRange
+
+// ==================== f_logReg() : BigBeluga LogReg ribbon ================
+// Ported from "Logarithmic Regression Channel-Trend [BigBeluga]" - a slow,
+// long-lookback (default 100 bars) log-regression trend line. Its direction
+// (current value vs 3 bars ago) is a much smoother read than the main
+// Chandelier trend, meant to stay flat/choppy during consolidation and only
+// turn decisively once a genuine bigger move is underway.
+f_logReg(float _src, int _len) =>
+    float _sumX    = 0.0
+    float _sumY    = 0.0
+    float _sumXSqr = 0.0
+    float _sumXY   = 0.0
+    for i = 0 to _len - 1
+        _val = math.log(_src[i])
+        _per = i + 1.0
+        _sumX += _per
+        _sumY += _val
+        _sumXSqr += _per * _per
+        _sumXY += _val * _per
+    _slope     = (_len * _sumXY - _sumX * _sumY) / (_len * _sumXSqr - _sumX * _sumX)
+    _average   = _sumY / _len
+    _intercept = _average - _slope * _sumX / _len + _slope
+    [_slope, _intercept]
+
+[ribSlope, ribIntercept] = f_logReg(c, ribbonLen)
+ribEnd = math.exp(ribIntercept)
+ribUp  = ribEnd > ribEnd[3]
+
+// current ATR above its own N-bar average = volatility expanding, not a
+// quiet/consolidating stretch. Direction-agnostic on purpose.
+atrAvg = ta.sma(atrVal, atrExpLen)
+atrExpanding = atrVal > atrAvg
+
+// ======================= f_flowBar() : per-bar delta ======================
+// Candle-colour volume proxy; price-body proxy when volume is absent (index).
+f_flowBar(bool _isIndex, float _o, float _c, float _vol) =>
+    float _raw = _isIndex or na(_vol) or _vol == 0 ? _c - _o : (_c > _o ? _vol : _c < _o ? -_vol : 0.0)
+    [nz(math.max(_raw, 0.0)), nz(math.max(-_raw, 0.0))]
+
+[buyBar, sellBar] = f_flowBar(symIsIndex, o, c, nz(volume))
+
+// ======================= f_score() : 0-100 confidence =====================
+// Both _ts and _ds originally rewarded EXTREMITY (far from the stop / a huge
+// one-sided volume imbalance) and both proved backwards in isolation-tested
+// live data: SL trades averaged HIGHER scores than TP3 winners on each one
+// alone (freshness 80.7%/73.2%, delta 74.7%/63.9%, over the same dataset).
+// An entry that's already extended far from the stop, or that fires into a
+// climactic one-sided volume spike, is late-stage / due for a reversal, not
+// "strong" - the pullback-entry mechanism only ever fires after a move has
+// already happened, so measuring "how big was that move" mostly measures
+// how exhausted it already is. Both factors inverted the same way: LESS
+// extremity (closer to the stop, a calmer/more balanced volume print) scores
+// higher. _pa (pressure alignment - does volume direction simply agree with
+// the trade) tested backwards too but only barely (90.5%/86.8%, a 3.7pt gap
+// vs ~10pt for the other two) - too weak to call it structural, left as-is.
+f_score(int _dir, float _c, float _stop, float _atr, float _pct, string _press, float _wT, float _wD, float _wP, float _tsFull, float _dsFull) =>
+    float _ext = _atr > 0 ? math.min(math.abs(_c - _stop) / (_atr * _tsFull), 1.0) : 0.0
+    float _ts = 1.0 - _ext
+    float _dm = math.min(math.abs(_pct) / _dsFull, 1.0)
+    float _ds = 1.0 - _dm
+    float _pa = (_dir == 1 and _press == "BUY PRESSURE") or (_dir == -1 and _press == "SELL PRESSURE") ? 1.0 : _press == "NEUTRAL" ? 0.5 : 0.0
+    float _w  = _wT + _wD + _wP
+    float _s  = _w > 0 ? (_wT * _ts + _wD * _ds + _wP * _pa) / _w : 0.0
+    int(math.round(_s * 100))
+
+// ================ f_nextPivLevels() / f_nearestPivLevel() =================
+// Both take the 7 fixed pivot levels (ascending S3..R3) and a direction.
+// f_nextPivLevels: the next 3 levels beyond _price in the trade direction -
+// used for pivot level-to-level TP1/TP2/TP3.
+// f_nearestPivLevel: the single nearest level on the "already broken" side
+// of _price - used for the pivot break & retest entry condition.
+f_nextPivLevels(float _price, int _dir, float _s3, float _s2, float _s1, float _pp, float _r1, float _r2, float _r3) =>
+    arr = array.from(_s3, _s2, _s1, _pp, _r1, _r2, _r3)
+    float _t1 = na
+    float _t2 = na
+    float _t3 = na
+    int _cnt = 0
+    if _dir == 1
+        for i = 0 to 6
+            v = array.get(arr, i)
+            if v > _price and _cnt < 3
+                if _cnt == 0
+                    _t1 := v
+                else if _cnt == 1
+                    _t2 := v
+                else
+                    _t3 := v
+                _cnt += 1
+    else
+        for i = 6 to 0
+            v = array.get(arr, i)
+            if v < _price and _cnt < 3
+                if _cnt == 0
+                    _t1 := v
+                else if _cnt == 1
+                    _t2 := v
+                else
+                    _t3 := v
+                _cnt += 1
+    [_t1, _t2, _t3]
+
+f_nearestPivLevel(float _price, int _dir, float _s3, float _s2, float _s1, float _pp, float _r1, float _r2, float _r3) =>
+    arr = array.from(_s3, _s2, _s1, _pp, _r1, _r2, _r3)
+    float _res = na
+    if _dir == 1
+        for i = 6 to 0
+            v = array.get(arr, i)
+            if v <= _price
+                _res := v
+                break
+    else
+        for i = 0 to 6
+            v = array.get(arr, i)
+            if v >= _price
+                _res := v
+                break
+    _res
+
+// ============================ STATE =======================================
+var float cumBuy  = 0.0
+var float cumSell = 0.0
+var array<float> buyHist  = array.new<float>()
+var array<float> sellHist = array.new<float>()
+
+var int   posDir        = 0
+var bool  r1Armed       = false
+var int   r1BarIdx      = na
+var int   barsSinceRef  = 0
+var float pkExtreme     = na
+var float swingStart    = na   // price at the flip bar (opposite extreme) - the Fib filter's 0% reference point
+var float orbHigh       = na   // opening-range high/low for the current session day - na until that day's OR window has printed at least one bar
+var float orbLow        = na
+var bool  tradeActive   = false
+var int   entryBarIdx   = na
+var int   posDirTrade   = 0
+var float entryPrice    = na
+var float rDist         = na
+var float slPrice       = na
+var float tp1Price      = na
+var float tp2Price      = na
+var float tp3Price      = na
+var bool  tp1Done       = false
+var bool  tp2Done       = false
+var bool  tp3Done       = false
+var bool  slDone        = false
+// stop-ratchet stage: 0 = still at the original SL, 1 = moved to entry
+// (breakeven) after TP1, 2 = moved up again to TP1 after TP2. Each TP hit
+// ratchets the stop to the PREVIOUS level, locking in that much progress -
+// TP3 needs no stage of its own since hitting it closes the trade outright.
+var int   slStage       = 0
+var int   entryScore    = 0
+var string exitReason   = ""   // "" while flat/active, "SL"/"BE+"/"TP1 LOCK"/"TP3" once the trade closes
+
+// re-entry counter: resets to 0 on every real trend flip (direction change)
+// ONLY - not tied to calendar/session days. R1 = 1st entry after the flip.
+// Once that trade closes (TP3 or SL), if a fresh pullback+resume (or the
+// lookback-force fallback) fires again in the SAME direction, that next
+// entry is R2, then R3, and so on, for as many same-direction re-entries as
+// occur before the trend actually flips the other way.
+var int    entryCount   = 0
+var string reentryTag   = "R1"
+
+// trade-count stats (bottom-left table)
+var int   cntTrades = 0
+var int   cntTp1    = 0
+var int   cntTp2    = 0
+var int   cntTp3    = 0
+var int   cntSl     = 0
+var int   cntBE     = 0
+var int   cntTp1Lock = 0   // exited at the TP1-ratcheted stop after TP2 printed - a partial win, not a wash
+
+// closed-trade accounting: EVERY way a trade can end (SL / BE+ / TP1-lock / TP3 /
+// trend flip / session end), in R (1R = the stop distance) and in price points.
+// Before this, trades cancelled by a trend flip had no recorded P&L at all.
+var int   cntFlipExit   = 0
+var int   cntSessExit   = 0
+var int   cntClosed     = 0
+var float sumR          = 0.0
+var float sumPts        = 0.0
+var float eqR           = 0.0
+var float peakR         = 0.0
+var float maxDdR        = 0.0
+var float eqUsd         = 0.0
+var float peakUsd       = 0.0
+var float maxDdUsd      = 0.0
+var int   lossStreak    = 0
+var int   maxLossStreak = 0
+var int   entryTime     = na   // bar-open time of the entry bar - doubles as the trade id in webhook messages
+
+// SL/TP3 quality breakdown - which trades fail vs win, by entry confidence and
+// by whether the trade was the 1st entry after a flip (R1) or a re-entry
+// (R2/R3/...). Answers "why is SL getting hit" with real numbers instead of
+// a guess: a much lower avg-confidence-at-entry on SL trades than TP3 trades,
+// or SL concentrated in re-entries, points straight at a filter to add.
+var bool  tradeIsReentry = false
+var float sumConfSl      = 0.0
+var float sumConfTp3     = 0.0
+var int   slR1           = 0
+var int   slReentry      = 0
+var int   tp3R1          = 0
+var int   tp3Reentry     = 0
+
+// published metrics - table reads these every bar, written on confirmed bars only
+var float  mBuy    = 0.0
+var float  mSell   = 0.0
+var float  mDiff   = 0.0
+var float  mPct    = 0.0
+var string mPress  = "NEUTRAL"
+var string mMarket = "RANGING"
+var int    mScore  = 0
+
+// drawing handles for the current trade
+var line  lnEntry = na
+var line  lnSL    = na
+var line  lnTP1   = na
+var line  lnTP2   = na
+var line  lnTP3   = na
+var label lbEntry = na
+var label lbSL    = na
+var label lbTP1   = na
+var label lbTP2   = na
+var label lbTP3   = na
+var label lbR1    = na
+
+// per-bar alert events (re-init to false every bar)
+entryEvent   = false
+tp1Event     = false
+tp2Event     = false
+tp3Event     = false
+slEvent      = false
+beEvent      = false
+tp1LockEvent = false
+// how (and at what price) a trade ended on THIS bar - set by whichever close path
+// fires first, consumed once by the accounting + webhook blocks below.
+float  exitPx   = na
+string exitKind = ""
+
+// ==================== CONFIRMED-BAR STATE MACHINE ========================
+if barstate.isconfirmed
+    isFlip = confFlipLong or confFlipShort
+
+    // ---- 1. delta accumulation --------------------------------------
+    if isFlip
+        cumBuy  := 0.0
+        cumSell := 0.0
+    cumBuy  += buyBar
+    cumSell += sellBar
+    array.push(buyHist, buyBar)
+    array.push(sellHist, sellBar)
+    if array.size(buyHist) > deltaWin
+        array.shift(buyHist)
+        array.shift(sellHist)
+
+    bv    = deltaModeIn == "Cumulative since flip" ? cumBuy  : array.sum(buyHist)
+    sv    = deltaModeIn == "Cumulative since flip" ? cumSell : array.sum(sellHist)
+    tot   = nz(bv) + nz(sv)
+    diff  = nz(bv) - nz(sv)
+    pct   = tot > 0 ? diff / tot * 100.0 : 0.0
+    press = pct > deltaThr ? "BUY PRESSURE" : pct < -deltaThr ? "SELL PRESSURE" : "NEUTRAL"
+    market = (dir == 1 and press == "BUY PRESSURE") ? "BULLISH" : (dir == -1 and press == "SELL PRESSURE") ? "BEARISH" : "RANGING"
+    sc = f_score(dir, c, trendStop, atrVal, pct, press, wTrend, wDelta, wPress, tsFullAtr, dsFullPct)
+
+    mBuy    := nz(bv)
+    mSell   := nz(sv)
+    mDiff   := diff
+    mPct    := pct
+    mPress  := press
+    mMarket := market
+    mScore  := sc
+
+    // ---- 2. trend flip --------------------------------------------
+    if isFlip
+        // A flip while a trade was still active cancels that trade's setup -
+        // clear its lines/labels immediately instead of leaving a stale
+        // ENTRY/SL/TP1-3 setup on the chart that no longer reflects reality.
+        label.delete(lbR1)
+        if tradeActive and exitOnFlip
+            exitPx      := c
+            exitKind    := "FLIP"
+            cntFlipExit += 1
+        if showLevels and tradeActive and exitOnFlip
+            line.delete(lnEntry)
+            line.delete(lnSL)
+            line.delete(lnTP1)
+            line.delete(lnTP2)
+            line.delete(lnTP3)
+            label.delete(lbEntry)
+            label.delete(lbSL)
+            label.delete(lbTP1)
+            label.delete(lbTP2)
+            label.delete(lbTP3)
+            lnEntry := na
+            lnSL    := na
+            lnTP1   := na
+            lnTP2   := na
+            lnTP3   := na
+            lbEntry := na
+            lbSL    := na
+            lbTP1   := na
+            lbTP2   := na
+            lbTP3   := na
+        posDir       := confFlipLong ? 1 : -1
+        barsSinceRef := 0
+        pkExtreme    := confFlipLong ? h : l
+        swingStart   := confFlipLong ? l : h
+        r1Armed      := false
+        r1BarIdx     := na
+        tradeActive  := tradeActive and not exitOnFlip
+        entryCount   := 0
+        exitReason   := ""
+    else if posDir != 0
+        barsSinceRef += 1
+        if not tradeActive
+            pkExtreme := posDir == 1 ? math.max(pkExtreme, h) : math.min(pkExtreme, l)
+
+    // opening-range high/low for the ORB filter - resets on a new session day,
+    // accumulates while inside the OR window, then holds fixed for the rest
+    // of that day once the window closes. newOrbDay (computed unconditionally
+    // above, since ta.change must run every bar) only acts when the filter is on.
+    if useOrbFilter
+        if newOrbDay
+            orbHigh := na
+            orbLow  := na
+        if not na(time(timeframe.period, orbRangeStr))
+            orbHigh := na(orbHigh) ? h : math.max(orbHigh, h)
+            orbLow  := na(orbLow)  ? l : math.min(orbLow, l)
+
+    // ---- 2b. optional: close the trade when the entry session ends ----
+    // First bar outside the session after a bar inside it: exit at that bar's
+    // open (a market order sent as the session closes would fill about there).
+    if exitAtSessionEnd and useSession and tradeActive and not inSession and inSession[1]
+        exitPx        := o
+        exitKind      := "SESSION"
+        cntSessExit   += 1
+        tradeActive   := false
+        exitReason    := "SESSION"
+        r1Armed       := false
+        r1BarIdx      := na
+        barsSinceRef  := 0
+        pkExtreme     := posDirTrade == 1 ? h : l
+        if showLevels
+            line.delete(lnEntry)
+            line.delete(lnSL)
+            line.delete(lnTP1)
+            line.delete(lnTP2)
+            line.delete(lnTP3)
+            label.delete(lbEntry)
+            label.delete(lbSL)
+            label.delete(lbTP1)
+            label.delete(lbTP2)
+            label.delete(lbTP3)
+            lnEntry := na
+            lnSL    := na
+            lnTP1   := na
+            lnTP2   := na
+            lnTP3   := na
+            lbEntry := na
+            lbSL    := na
+            lbTP1   := na
+            lbTP2   := na
+            lbTP3   := na
+
+    // ---- 3. R1/R2/R3... + ENTRY -----------------------------------
+    // Runs whenever we're flat in a known direction - the 1st time right
+    // after the flip, and again each time the PREVIOUS trade in this same
+    // direction has closed (tradeActive false, direction unchanged). A
+    // direction change is handled entirely by the flip block above, which
+    // resets entryCount to 0 - the re-entry NUMBERING (R1/R2/R3) still has
+    // nothing to do with time of day. inSession only gates whether a NEW
+    // trade is allowed to actually fire right now - pkExtreme/barsSinceRef
+    // (step 2, above) keep tracking through the closed session so the setup
+    // is current the moment the session reopens, instead of stale.
+    if posDir != 0 and not tradeActive and inSession
+        pull   = posDir == 1 ? pkExtreme - l : h - pkExtreme
+        deep   = pull >= r1PbAtr * atrVal
+        resume = posDir == 1 ? c > o : c < o
+        if not r1Armed and barsSinceRef <= r1Lookback and deep
+            r1Armed    := true
+            r1BarIdx   := bar_index
+            reentryTag := "R" + str.tostring(entryCount + 1)
+            lbR1 := label.new(bar_index, posDir == 1 ? l : h, reentryTag, xloc = xloc.bar_index, yloc = posDir == 1 ? yloc.belowbar : yloc.abovebar, color = color.new(#2962ff, 0), textcolor = color.white, style = posDir == 1 ? label.style_label_up : label.style_label_down, size = size.small)
+        vwapOk = not useVwapFilter or (posDir == 1 ? c > vwapVal : c < vwapVal)
+        emaOk  = not useEmaFilter  or (posDir == 1 ? emaFast > emaSlow : emaFast < emaSlow)
+        orbOk  = not useOrbFilter  or (not na(orbHigh) and not na(orbLow) and (posDir == 1 ? c > orbHigh : c < orbLow))
+        swingSize = math.abs(pkExtreme - swingStart)
+        fibRatio  = swingSize > 0 ? pull / swingSize : 0.0
+        fibOk  = not useFibFilter or (fibRatio >= fibMin and fibRatio <= fibMax)
+        ribbonOk = not useRibbonFilter or (posDir == 1 ? ribUp : not ribUp)
+        atrExpOk = not useAtrExpFilter or atrExpanding
+        gapExpandingOk = emaGapExpanding
+        retestOk = posDir == 1 ? (l <= emaFast and c > emaFast) : (h >= emaFast and c < emaFast)
+        freshCrossOk = barsSinceEmaCross <= emaCrossLookback and (posDir == 1 ? emaFast > emaSlow : emaFast < emaSlow)
+        slopeOk = posDir == 1 ? emaFast > emaFast[emaCrossLookback] : emaFast < emaFast[emaCrossLookback]
+        tripleOk = posDir == 1 ? (emaFast > emaSlow and emaSlow > emaTriple) : (emaFast < emaSlow and emaSlow < emaTriple)
+        emaTypeOk = emaCrossType == "Gap expanding" ? gapExpandingOk : emaCrossType == "Retest only" ? retestOk : emaCrossType == "Fresh crossover" ? freshCrossOk : emaCrossType == "EMA slope" ? slopeOk : tripleOk
+        emaXROk = not useEmaXRFilter or emaTypeOk
+        pivotFilterOk = not usePivotFilter or (posDir == 1 ? c > pivPP : c < pivPP)
+        htfOk = not useHtfFilter or (posDir == 1 ? htfDir == 1 : htfDir == -1)
+        nearestPivLevel = f_nearestPivLevel(c, posDir, pivS3, pivS2, pivS1, pivPP, pivR1, pivR2, pivR3)
+        pivotBreakRetestOk = not usePivotBreakRetest or (not na(nearestPivLevel) and (posDir == 1 ? (l <= nearestPivLevel and c > nearestPivLevel) : (h >= nearestPivLevel and c < nearestPivLevel)))
+        armed = ((r1Armed and bar_index > r1BarIdx and resume) or (r1Force and barsSinceRef >= r1Lookback)) and mScore >= minConfidence and vwapOk and emaOk and orbOk and fibOk and ribbonOk and atrExpOk and emaXROk and pivotFilterOk and pivotBreakRetestOk and htfOk
+        if armed
+            tradeActive := true
+            posDirTrade := posDir
+            entryBarIdx := bar_index
+            entryTime   := time
+            entryPrice  := c
+            rDist       := slAtrMult * atrVal
+            slPrice     := posDir == 1 ? entryPrice - rDist : entryPrice + rDist
+            [pivTp1, pivTp2, pivTp3] = f_nextPivLevels(entryPrice, posDir, pivS3, pivS2, pivS1, pivPP, pivR1, pivR2, pivR3)
+            tp1Price    := usePivotLevelExits and not na(pivTp1) ? pivTp1 : (posDir == 1 ? entryPrice + tp1Mult * rDist : entryPrice - tp1Mult * rDist)
+            tp2Price    := usePivotLevelExits and not na(pivTp2) ? pivTp2 : (posDir == 1 ? entryPrice + tp2Mult * rDist : entryPrice - tp2Mult * rDist)
+            tp3Price    := usePivotLevelExits and not na(pivTp3) ? pivTp3 : (posDir == 1 ? entryPrice + tp3Mult * rDist : entryPrice - tp3Mult * rDist)
+            tp1Done     := false
+            tp2Done     := false
+            tp3Done     := false
+            slDone      := false
+            slStage     := 0
+            entryScore  := mScore
+            tradeIsReentry := entryCount > 0
+            entryEvent  := true
+            entryCount  += 1
+            cntTrades   += 1
+            r1Armed     := false
+            r1BarIdx    := na
+            if showTpSlMarkers
+                // Permanent entry marker - unlike lnEntry/lbEntry below (which get
+                // deleted once the NEXT entry fires), this one is never deleted, so
+                // a completed trade's entry price stays visible as history, same as
+                // its TP1/TP2/TP3/SL/BE markers do.
+                label.new(bar_index, entryPrice, "ENTRY " + str.tostring(entryPrice, format.mintick), xloc = xloc.bar_index, yloc = yloc.price, style = posDir == 1 ? label.style_label_up : label.style_label_down, color = color.new(color.white, 20), textcolor = color.black, size = size.tiny)
+            if showLevels
+                // Redundant safety cleanup - every close path (SL/BE+/TP1LOCK/TP3/flip)
+                // already deletes and nulls these, but clear again here in case any
+                // are somehow still set before drawing this trade's fresh set.
+                line.delete(lnEntry)
+                line.delete(lnSL)
+                line.delete(lnTP1)
+                line.delete(lnTP2)
+                line.delete(lnTP3)
+                label.delete(lbEntry)
+                label.delete(lbSL)
+                label.delete(lbTP1)
+                label.delete(lbTP2)
+                label.delete(lbTP3)
+                eTxt = scoreOnEntry ? "ENTRY  " + str.tostring(entryScore) + "%" : "ENTRY"
+                // x2 starts equal to bar_index (zero-length) and is extended one bar
+                // at a time by the real-time block below for as long as the trade
+                // stays active, freezing at whichever bar actually closes it.
+                lnEntry := line.new(bar_index, entryPrice, bar_index, entryPrice, xloc = xloc.bar_index, color = color.white, style = line.style_dashed, width = 1)
+                lbEntry := label.new(bar_index, entryPrice, eTxt, xloc = xloc.bar_index, yloc = yloc.price, color = color.white, textcolor = color.black, style = label.style_label_left, size = size.small)
+                lnSL := line.new(bar_index, slPrice, bar_index, slPrice, xloc = xloc.bar_index, color = colShort, style = line.style_solid, width = 1)
+                lbSL := label.new(bar_index, slPrice, "SL", xloc = xloc.bar_index, yloc = yloc.price, color = colShort, textcolor = color.white, style = label.style_label_left, size = size.small)
+                lnTP1 := line.new(bar_index, tp1Price, bar_index, tp1Price, xloc = xloc.bar_index, color = colTP, style = line.style_solid, width = 1)
+                lbTP1 := label.new(bar_index, tp1Price, "TP1", xloc = xloc.bar_index, yloc = yloc.price, color = colTP, textcolor = color.white, style = label.style_label_left, size = size.small)
+                lnTP2 := line.new(bar_index, tp2Price, bar_index, tp2Price, xloc = xloc.bar_index, color = colTP, style = line.style_solid, width = 1)
+                lbTP2 := label.new(bar_index, tp2Price, "TP2", xloc = xloc.bar_index, yloc = yloc.price, color = colTP, textcolor = color.white, style = label.style_label_left, size = size.small)
+                lnTP3 := line.new(bar_index, tp3Price, bar_index, tp3Price, xloc = xloc.bar_index, color = colTP, style = line.style_solid, width = 1)
+                lbTP3 := label.new(bar_index, tp3Price, "TP3", xloc = xloc.bar_index, yloc = yloc.price, color = colTP, textcolor = color.white, style = label.style_label_left, size = size.small)
+
+// ---- 4. TP / SL monitoring (real-time, every tick) -----------------------
+// Deliberately OUTSIDE the barstate.isconfirmed gate above: the levels being
+// watched (slPrice/tp1Price/tp2Price/tp3Price) were only ever set on a
+// confirmed ENTRY bar, so this cannot repaint a trade's identity - it only
+// checks, live, whether the current bar's high/low has touched an
+// already-fixed price, so the hit marker/label appears the instant price
+// touches the level instead of waiting for the bar to close.
+if tradeActive and bar_index > entryBarIdx
+    isLong = posDirTrade == 1
+    // Extend the trade-setup lines/labels to the current bar before checking
+    // for a hit this tick, so a same-tick close (TP3/SL) still lands the
+    // frozen line end exactly on the bar the trade actually closed on.
+    if showLevels
+        if not na(lnEntry)
+            line.set_x2(lnEntry, bar_index)
+            label.set_x(lbEntry, bar_index)
+        if not na(lnSL)
+            line.set_x2(lnSL, bar_index)
+            label.set_x(lbSL, bar_index)
+        if not na(lnTP1)
+            line.set_x2(lnTP1, bar_index)
+            label.set_x(lbTP1, bar_index)
+        if not na(lnTP2)
+            line.set_x2(lnTP2, bar_index)
+            label.set_x(lbTP2, bar_index)
+        if not na(lnTP3)
+            line.set_x2(lnTP3, bar_index)
+            label.set_x(lbTP3, bar_index)
+    if not slDone and (isLong ? l <= slPrice : h >= slPrice)
+        slDone       := true
+        tradeActive  := false
+        exitReason   := slStage == 2 ? "TP1 LOCK" : slStage == 1 ? "BE+" : "SL"
+        if na(exitPx)
+            exitPx   := slPrice
+            exitKind := slStage == 2 ? "TP1LOCK" : slStage == 1 ? "BE" : "SL"
+        if slStage == 2
+            cntTp1Lock   += 1
+            tp1LockEvent := true
+        else if slStage == 1
+            cntBE   += 1
+            beEvent := true
+        else
+            cntSl     += 1
+            sumConfSl += entryScore
+            slEvent   := true
+            if tradeIsReentry
+                slReentry += 1
+            else
+                slR1 += 1
+        r1Armed      := false
+        r1BarIdx     := na
+        barsSinceRef := 0
+        pkExtreme    := posDir == 1 ? h : l
+        if hlHits and not na(lnSL) and slStage == 0
+            line.set_color(lnSL, color.new(colShort, 55))
+        // trade is closed now - clear its setup immediately instead of
+        // leaving a stale ENTRY/SL/TP1-3 drawing on the chart until the
+        // next entry replaces it (was misleading: looked like an open trade).
+        if showLevels
+            line.delete(lnEntry)
+            line.delete(lnSL)
+            line.delete(lnTP1)
+            line.delete(lnTP2)
+            line.delete(lnTP3)
+            label.delete(lbEntry)
+            label.delete(lbSL)
+            label.delete(lbTP1)
+            label.delete(lbTP2)
+            label.delete(lbTP3)
+            lnEntry := na
+            lnSL    := na
+            lnTP1   := na
+            lnTP2   := na
+            lnTP3   := na
+            lbEntry := na
+            lbSL    := na
+            lbTP1   := na
+            lbTP2   := na
+            lbTP3   := na
+    if tradeActive and not tp1Done and (isLong ? h >= tp1Price : l <= tp1Price)
+        tp1Done  := true
+        tp1Event := true
+        cntTp1   += 1
+        if hlHits and not na(lnTP1)
+            line.set_color(lnTP1, color.new(colTP, 35))
+        if showTpSlMarkers
+            label.new(bar_index, h, "TP1", style = label.style_label_down, color = color.new(color.green, 50), textcolor = color.white, size = size.tiny, yloc = yloc.abovebar)
+        // ratchet 1: move the stop to entry + a small locked-in profit (not
+        // exactly breakeven) once TP1 prints - beLockR=0 reproduces the old
+        // exact-breakeven behaviour, beLockR>0 turns a net-zero reversal
+        // into a small guaranteed win instead.
+        if slStage == 0
+            slStage := 1
+            beLockPrice = isLong ? entryPrice + beLockR * rDist : entryPrice - beLockR * rDist
+            slPrice := beLockPrice
+            if showLevels and not na(lnSL)
+                line.set_y1(lnSL, beLockPrice)
+                line.set_y2(lnSL, beLockPrice)
+                line.set_color(lnSL, color.new(#787b86, 0))
+            if showLevels and not na(lbSL)
+                label.set_y(lbSL, beLockPrice)
+                label.set_text(lbSL, "BE+")
+                label.set_color(lbSL, color.new(#787b86, 0))
+    if tradeActive and not tp2Done and (isLong ? h >= tp2Price : l <= tp2Price)
+        tp2Done  := true
+        tp2Event := true
+        cntTp2   += 1
+        if hlHits and not na(lnTP2)
+            line.set_color(lnTP2, color.new(colTP, 35))
+        if showTpSlMarkers
+            label.new(bar_index, h, "TP2", style = label.style_label_down, color = color.new(color.green, 50), textcolor = color.white, size = size.tiny, yloc = yloc.abovebar)
+        // ratchet 2: move the stop up again, from breakeven to TP1, once TP2
+        // prints - locks in TP1-level profit instead of just breakeven if
+        // price comes back down and the (now higher) stop gets hit.
+        slStage := 2
+        slPrice := tp1Price
+        if showLevels and not na(lnSL)
+            line.set_y1(lnSL, tp1Price)
+            line.set_y2(lnSL, tp1Price)
+        if showLevels and not na(lbSL)
+            label.set_y(lbSL, tp1Price)
+            label.set_text(lbSL, "TP1")
+    if tradeActive and not tp3Done and (isLong ? h >= tp3Price : l <= tp3Price)
+        tp3Done      := true
+        tp3Event     := true
+        tradeActive  := false
+        exitReason   := "TP3"
+        if na(exitPx)
+            exitPx   := tp3Price
+            exitKind := "TP3"
+        cntTp3        += 1
+        sumConfTp3    += entryScore
+        if tradeIsReentry
+            tp3Reentry += 1
+        else
+            tp3R1 += 1
+        r1Armed      := false
+        r1BarIdx     := na
+        barsSinceRef := 0
+        pkExtreme    := posDir == 1 ? h : l
+        if hlHits and not na(lnTP3)
+            line.set_color(lnTP3, color.new(colTP, 35))
+        // trade is closed now - clear its setup immediately (see SL block above).
+        if showLevels
+            line.delete(lnEntry)
+            line.delete(lnSL)
+            line.delete(lnTP1)
+            line.delete(lnTP2)
+            line.delete(lnTP3)
+            label.delete(lbEntry)
+            label.delete(lbSL)
+            label.delete(lbTP1)
+            label.delete(lbTP2)
+            label.delete(lbTP3)
+            lnEntry := na
+            lnSL    := na
+            lnTP1   := na
+            lnTP2   := na
+            lnTP3   := na
+            lbEntry := na
+            lbSL    := na
+            lbTP1   := na
+            lbTP2   := na
+            lbTP3   := na
+
+// ---- 5. closed-trade accounting (one place, whichever way the trade ended) ----
+if not na(exitPx)
+    tradePts  = (exitPx - entryPrice) * posDirTrade
+    tradeR    = rDist > 0 ? tradePts / rDist : 0.0
+    tradeUsd  = tradePts * syminfo.pointvalue - costPerTrade
+    cntClosed += 1
+    sumR      += tradeR
+    sumPts    += tradePts
+    eqR       += tradeR
+    peakR     := math.max(peakR, eqR)
+    maxDdR    := math.max(maxDdR, peakR - eqR)
+    eqUsd     += tradeUsd
+    peakUsd   := math.max(peakUsd, eqUsd)
+    maxDdUsd  := math.max(maxDdUsd, peakUsd - eqUsd)
+    if tradeR < 0
+        lossStreak    += 1
+        maxLossStreak := math.max(maxLossStreak, lossStreak)
+    else
+        lossStreak := 0
+
+// ---- 6. ONE webhook alert per bar, carrying every event of that bar --------
+// The executor needs the DIRECTION and the LEVELS, which the old static
+// alertcondition() text could not carry. The bar-close alert below is the
+// authoritative copy; the exit price in the message is the level that was
+// touched, not the bar close. Because TP/SL touches are detected every tick,
+// a second copy is sent the moment a NEW set of events appears (see varip
+// below) so the executor moves its stop / takes profit seconds after the
+// touch instead of up to one bar later. The receiver dedupes on (trade, event).
+f_px(float _x) => str.tostring(_x, format.mintick)
+
+string evts   = ""
+string dirTxt = posDirTrade == 1 ? "LONG" : "SHORT"
+string tidTxt = '"tid":"' + str.tostring(entryTime) + '"'
+if entryEvent
+    evts := '{"e":"ENTRY",' + tidTxt + ',"dir":"' + dirTxt + '","px":' + f_px(entryPrice) + ',"sl":' + f_px(slPrice) + ',"tp1":' + f_px(tp1Price) + ',"tp2":' + f_px(tp2Price) + ',"tp3":' + f_px(tp3Price) + ',"conf":' + str.tostring(entryScore) + ',"tag":"' + reentryTag + '"}'
+if tp1Event
+    evts += (evts == "" ? "" : ",") + '{"e":"TP1",' + tidTxt + ',"px":' + f_px(tp1Price) + ',"new_sl":' + f_px(slPrice) + '}'
+if tp2Event
+    evts += (evts == "" ? "" : ",") + '{"e":"TP2",' + tidTxt + ',"px":' + f_px(tp2Price) + ',"new_sl":' + f_px(slPrice) + '}'
+if not na(exitPx)
+    evts += (evts == "" ? "" : ",") + '{"e":"EXIT",' + tidTxt + ',"dir":"' + dirTxt + '","kind":"' + exitKind + '","px":' + f_px(exitPx) + '}'
+// varip survives the per-tick rollback of the realtime bar, so "what did I already send"
+// is remembered between ticks (a plain var would be reset on every tick).
+varip string lastIntrabarSent = ""
+if autoAlertOn and evts != ""
+    string alertMsg = '{"secret":"' + webhookSecret + '","sym":"' + syminfo.prefix + ':' + syminfo.ticker + '","tf":"' + timeframe.period + '","bar":' + str.tostring(time) + ',"pv":' + str.tostring(syminfo.pointvalue) + ',"events":[' + evts + ']}'
+    alert(alertMsg, alert.freq_once_per_bar_close)
+    if barstate.isrealtime and evts != lastIntrabarSent
+        lastIntrabarSent := evts
+        alert(alertMsg, alert.freq_all)
+
+// ============================ PLOTS ======================================
+plot(showStop and dir ==  1 ? longStop  : na, "Long trailing stop",  color = colLong,  linewidth = 2, style = plot.style_linebr)
+plot(showStop and dir == -1 ? shortStop : na, "Short trailing stop", color = colShort, linewidth = 2, style = plot.style_linebr)
+
+plotshape(showFlip and confFlipLong,  "BUY flip",  shape.labelup,   location.belowbar, colLong,  text = "BUY",  textcolor = color.white, size = size.small)
+plotshape(showFlip and confFlipShort, "SELL flip", shape.labeldown, location.abovebar, colShort, text = "SELL", textcolor = color.white, size = size.small)
+
+// TP1 / TP2 hit markers are drawn inline in the monitoring block above via
+// label.new(bar_index, ...) - a fresh label per hit, never deleted, so every
+// past trade's markers stay on the chart permanently (trade history).
+// TP3 (final), SL, BE+, and TP1 LOCK hit markers below are shape plots tied
+// to the bar they fire on - same permanent-history behaviour, never repainted.
+plotshape(showTpSlMarkers and tp3Event,     "TP3 hit (final)", shape.circle, location.abovebar, color.new(#00ff00, 0), text = "🎯 TP", textcolor = #00ff00,     size = size.small)
+plotshape(showTpSlMarkers and slEvent,      "SL hit",       shape.xcross, location.belowbar, color.new(colShort, 0), text = "SL",  textcolor = color.white, size = size.small)
+plotshape(showTpSlMarkers and beEvent,      "BE+ hit",      shape.xcross, location.belowbar, color.new(#787b86, 0),  text = "BE+", textcolor = color.white, size = size.small)
+plotshape(showTpSlMarkers and tp1LockEvent, "TP1 LOCK hit", shape.xcross, location.belowbar, color.new(colTP, 0),    text = "TP1", textcolor = color.white, size = size.small)
+
+// ============================ DASHBOARD ==================================
+// Two small tables, plain words, never more than ~10 rows each so they cannot
+// overlap: SIGNAL (top, what is happening now) and RESULTS (bottom, history).
+f_posMap(string _s) =>
+    switch _s
+        "Top right"    => position.top_right
+        "Top left"     => position.top_left
+        "Bottom right" => position.bottom_right
+        "Bottom left"  => position.bottom_left
+        "Middle right" => position.middle_right
+        => position.top_right
+
+f_sizeMap(string _s) =>
+    switch _s
+        "Tiny"   => size.tiny
+        "Small"  => size.small
+        "Normal" => size.normal
+        "Large"  => size.large
+        => size.normal
+
+f_usd(float _x) =>
+    (_x < 0 ? "-$" : "+$") + str.tostring(math.abs(math.round(_x)), "#")
+
+f_pct(int _n, int _tot) =>
+    _tot > 0 ? " (" + str.tostring(_n * 100.0 / _tot, "#") + "%)" : ""
+
+var table  dash     = na
+var string prevSig  = ""
+
+if not showTable and not na(dash)
+    table.delete(dash)
+    dash := na
+
+if showTable and barstate.islast
+    sig = str.tostring(dir) + "|" + mPress + "|" + str.tostring(mScore) + "|" + tblPosIn + "|" + tblSizeIn + "|" + str.tostring(entryCount) + "|" + str.tostring(tradeActive) + "|" + str.tostring(posDirTrade) + "|" + str.tostring(entryPrice) + "|" + str.tostring(slPrice) + "|" + str.tostring(slStage) + "|" + str.tostring(tp1Price) + "|" + str.tostring(tp2Price) + "|" + str.tostring(tp3Price) + "|" + exitReason + "|" + str.tostring(htfDir)
+    if na(dash) or sig != prevSig
+        prevSig := sig
+        if not na(dash)
+            table.delete(dash)
+        ts    = f_sizeMap(tblSizeIn)
+        nR    = 5 + (tradeActive ? 3 : (entryCount > 0 ? 1 : 0)) + (useHtfFilter ? 1 : 0)
+        dash  := table.new(f_posMap(tblPosIn), 2, nR, bgcolor = color.new(#0e0e12, 8), border_width = 1, border_color = color.new(#787b86, 55), frame_width = 1, frame_color = color.new(#787b86, 40))
+        lblBg = color.new(#2a2e39, 8)
+        hdrBg = color.new(#ff9800, 50)
+        lc    = color.new(#d1d4dc, 0)
+        rr = 0
+        table.merge_cells(dash, 0, rr, 1, rr)
+        table.cell(dash, 0, rr, "GOPI HEDGE X PRO", text_color = color.white, bgcolor = hdrBg, text_size = ts)
+        rr += 1
+        bull = dir == 1
+        table.cell(dash, 0, rr, "TREND", text_color = lc, bgcolor = lblBg, text_size = ts)
+        table.cell(dash, 1, rr, bull ? "UP  (look for BUY)" : "DOWN  (look for SELL)", text_color = bull ? colLong : colShort, bgcolor = lblBg, text_size = ts)
+        rr += 1
+        if useHtfFilter
+            hAgree = htfDir == dir
+            hTxt   = (htfDir == 1 ? "UP" : "DOWN") + (hAgree ? "  (same as trend: trades allowed)" : "  (opposite: no new trades)")
+            table.cell(dash, 0, rr, htfTfIn == "240" ? "4-HOUR TREND" : htfTfIn == "60" ? "1-HOUR TREND" : "DAILY TREND", text_color = lc, bgcolor = lblBg, text_size = ts)
+            table.cell(dash, 1, rr, hTxt, text_color = hAgree ? colLong : color.new(#ffa726, 0), bgcolor = lblBg, text_size = ts)
+            rr += 1
+        posLabel = tradeActive ? (posDirTrade == 1 ? "LONG  (bought)" : "SHORT  (sold)") : "NO TRADE"
+        posCol   = tradeActive ? (posDirTrade == 1 ? colLong : colShort) : color.gray
+        table.cell(dash, 0, rr, "TRADE", text_color = lc, bgcolor = lblBg, text_size = ts)
+        table.cell(dash, 1, rr, posLabel, text_color = posCol, bgcolor = lblBg, text_size = ts)
+        rr += 1
+        if tradeActive
+            table.cell(dash, 0, rr, "ENTRY PRICE", text_color = lc, bgcolor = lblBg, text_size = ts)
+            table.cell(dash, 1, rr, str.tostring(entryPrice, format.mintick), text_color = color.white, bgcolor = lblBg, text_size = ts)
+            rr += 1
+            table.cell(dash, 0, rr, "STOP-LOSS", text_color = lc, bgcolor = lblBg, text_size = ts)
+            table.cell(dash, 1, rr, str.tostring(slPrice, format.mintick) + (slStage > 0 ? "  (moved, profit locked)" : ""), text_color = slStage > 0 ? colTP : colShort, bgcolor = lblBg, text_size = ts)
+            rr += 1
+            table.cell(dash, 0, rr, "TARGETS 1 / 2 / 3", text_color = lc, bgcolor = lblBg, text_size = ts)
+            table.cell(dash, 1, rr, str.tostring(tp1Price, format.mintick) + " / " + str.tostring(tp2Price, format.mintick) + " / " + str.tostring(tp3Price, format.mintick), text_color = colTP, bgcolor = lblBg, text_size = ts)
+            rr += 1
+        else if entryCount > 0
+            lastTxt = exitReason == "SL" ? "Stop-loss was hit" : exitReason == "TP3" ? "Final target hit" : exitReason == "TP1 LOCK" ? "Closed with profit" : exitReason == "BE+" ? "Closed, small profit" : exitReason == "SESSION" ? "Closed at session end" : exitReason == "" ? "-" : exitReason
+            lastCol = exitReason == "SL" ? colShort : (exitReason == "TP3" or exitReason == "TP1 LOCK" or exitReason == "BE+") ? colTP : color.gray
+            table.cell(dash, 0, rr, "LAST TRADE", text_color = lc, bgcolor = lblBg, text_size = ts)
+            table.cell(dash, 1, rr, lastTxt, text_color = lastCol, bgcolor = lblBg, text_size = ts)
+            rr += 1
+        pTxt = mPress == "BUY PRESSURE" ? "BUYERS stronger" : mPress == "SELL PRESSURE" ? "SELLERS stronger" : "BALANCED"
+        pcol = mPress == "BUY PRESSURE" ? colLong : mPress == "SELL PRESSURE" ? colShort : color.gray
+        table.cell(dash, 0, rr, "VOLUME", text_color = lc, bgcolor = lblBg, text_size = ts)
+        table.cell(dash, 1, rr, pTxt, text_color = pcol, bgcolor = lblBg, text_size = ts)
+        rr += 1
+        scol = mScore >= minConfidence ? colLong : color.new(#ffa726, 0)
+        table.cell(dash, 0, rr, "CONFIDENCE", text_color = lc, bgcolor = lblBg, text_size = ts)
+        table.cell(dash, 1, rr, str.tostring(mScore) + "%" + (mScore >= minConfidence ? "  (enough to enter)" : "  (too low to enter)"), text_color = scol, bgcolor = lblBg, text_size = ts)
+        rr += 1
+
+// ==================== RESULTS TABLE (bottom right) ========================
+var table  statsTbl    = na
+var int    firstBarT   = na
+if na(firstBarT)
+    firstBarT := time
+var string prevStatsSig = ""
+
+if not showStatsTable and not na(statsTbl)
+    table.delete(statsTbl)
+    statsTbl := na
+
+if showStatsTable and barstate.islast
+    statsSig = str.tostring(cntTrades) + "|" + str.tostring(cntTp3) + "|" + str.tostring(cntSl) + "|" + str.tostring(cntBE) + "|" + str.tostring(cntTp1Lock) + "|" + str.tostring(cntClosed) + "|" + str.tostring(eqUsd) + "|" + str.tostring(maxDdUsd) + "|" + str.tostring(maxLossStreak) + "|" + tblSizeIn
+    if na(statsTbl) or statsSig != prevStatsSig
+        prevStatsSig := statsSig
+        if not na(statsTbl)
+            table.delete(statsTbl)
+        sts    = f_sizeMap(tblSizeIn)
+        slc    = color.new(#d1d4dc, 0)
+        slblBg = color.new(#2a2e39, 8)
+        statsTbl := table.new(position.bottom_right, 2, 11, bgcolor = color.new(#0e0e12, 8), border_width = 1, border_color = color.new(#787b86, 55), frame_width = 1, frame_color = color.new(#787b86, 40))
+        table.merge_cells(statsTbl, 0, 0, 1, 0)
+        table.cell(statsTbl, 0, 0, "RESULTS ON THIS CHART", text_color = color.white, bgcolor = color.new(#ff9800, 50), text_size = sts)
+        smallWins = cntBE + cntTp1Lock
+        avgUsd    = cntClosed > 0 ? eqUsd / cntClosed : 0.0
+        table.cell(statsTbl, 0, 1, "TRADES", text_color = slc, bgcolor = slblBg, text_size = sts)
+        table.cell(statsTbl, 1, 1, str.tostring(cntTrades), text_color = color.white, bgcolor = slblBg, text_size = sts)
+        table.cell(statsTbl, 0, 2, "LOST (stop-loss hit)", text_color = slc, bgcolor = slblBg, text_size = sts)
+        table.cell(statsTbl, 1, 2, str.tostring(cntSl) + f_pct(cntSl, cntTrades), text_color = colShort, bgcolor = slblBg, text_size = sts)
+        table.cell(statsTbl, 0, 3, "SMALL WIN (stop moved up)", text_color = slc, bgcolor = slblBg, text_size = sts)
+        table.cell(statsTbl, 1, 3, str.tostring(smallWins) + f_pct(smallWins, cntTrades), text_color = color.new(#787b86, 0), bgcolor = slblBg, text_size = sts)
+        table.cell(statsTbl, 0, 4, "BIG WIN (final target)", text_color = slc, bgcolor = slblBg, text_size = sts)
+        table.cell(statsTbl, 1, 4, str.tostring(cntTp3) + f_pct(cntTp3, cntTrades), text_color = colTP, bgcolor = slblBg, text_size = sts)
+        table.cell(statsTbl, 0, 5, "TOTAL RESULT", text_color = slc, bgcolor = slblBg, text_size = sts)
+        table.cell(statsTbl, 1, 5, f_usd(eqUsd), text_color = eqUsd >= 0 ? colTP : colShort, bgcolor = slblBg, text_size = sts)
+        table.cell(statsTbl, 0, 6, "AVERAGE PER TRADE", text_color = slc, bgcolor = slblBg, text_size = sts)
+        table.cell(statsTbl, 1, 6, f_usd(avgUsd), text_color = avgUsd >= 0 ? colTP : colShort, bgcolor = slblBg, text_size = sts)
+        table.cell(statsTbl, 0, 7, "BIGGEST DROP", text_color = slc, bgcolor = slblBg, text_size = sts)
+        table.cell(statsTbl, 1, 7, "-$" + str.tostring(math.round(maxDdUsd), "#"), text_color = colShort, bgcolor = slblBg, text_size = sts)
+        table.cell(statsTbl, 0, 8, "WORST LOSING STREAK", text_color = slc, bgcolor = slblBg, text_size = sts)
+        table.cell(statsTbl, 1, 8, str.tostring(maxLossStreak) + " in a row", text_color = colShort, bgcolor = slblBg, text_size = sts)
+        yrsCov = (timenow - firstBarT) / (365.25 * 86400000.0)
+        table.cell(statsTbl, 0, 10, "PERIOD", text_color = slc, bgcolor = slblBg, text_size = sts)
+        table.cell(statsTbl, 1, 10, str.format_time(firstBarT, "yyyy-MM-dd") + "  (" + str.tostring(yrsCov, "#.#") + " years)", text_color = color.white, bgcolor = slblBg, text_size = sts)
+        table.cell(statsTbl, 0, 9, "1 CONTRACT =", text_color = slc, bgcolor = slblBg, text_size = sts)
+        table.cell(statsTbl, 1, 9, "$" + str.tostring(syminfo.pointvalue) + " per 1.0 move  (after costs)", text_color = color.white, bgcolor = slblBg, text_size = sts)
+
+// ============================ ALERTS ====================================
+alertcondition(confFlipLong,  "Trend flip - LONG",  "GOPI HEDGE X PRO: trend flipped LONG")
+alertcondition(confFlipShort, "Trend flip - SHORT", "GOPI HEDGE X PRO: trend flipped SHORT")
+alertcondition(entryEvent,    "Entry triggered",    "GOPI HEDGE X PRO: ENTRY triggered")
+alertcondition(tp1Event,      "TP1 hit",            "GOPI HEDGE X PRO: TP1 hit")
+alertcondition(tp2Event,      "TP2 hit",            "GOPI HEDGE X PRO: TP2 hit")
+alertcondition(tp3Event,      "TP3 hit",            "GOPI HEDGE X PRO: TP3 hit")
+alertcondition(slEvent,       "SL hit",             "GOPI HEDGE X PRO: SL hit")
+alertcondition(beEvent,       "BE+ exit",           "GOPI HEDGE X PRO: breakeven+ exit (small locked profit, not a loss)")
+alertcondition(tp1LockEvent,  "TP1 LOCK exit",      "GOPI HEDGE X PRO: TP1-lock exit (stopped at the TP1 level after TP2 printed)")

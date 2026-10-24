@@ -1,0 +1,14 @@
+{
+ "account_start_usd": 10000,
+ "qty": 6,
+ "enforce_margin": false,
+ "tick_size": 0.25,
+ "commission_per_side_usd": 0.77,
+ "daily_loss_cap_pct": 3.0,
+ "halt_below_equity_pct": 85.0,
+ "summary_time_et": "21:45",
+ "broker": {
+  "mode": "dry_run",
+  "account_id": "YOUR_WEBULL_SANDBOX_FUTURES_ACCOUNT_ID"
+ }
+}
